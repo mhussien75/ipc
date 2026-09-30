@@ -33,7 +33,7 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 SECRET_KEY = os.getenv("SECRET_KEY", "")
 MANAGER_EMAILS = [p.strip() for p in os.getenv("MANAGER_EMAILS", "").split(",") if p.strip()]
 
-# JSON Bin configuration
+# JSON Bin configuration ( hardcoded your Bin ID directly )
 JSON_BIN_ID = os.getenv("JSON_BIN_ID", "6abcf643ac6210605a05327a")
 JSON_BIN_MASTER_KEY = os.getenv("JSON_BIN_MASTER_KEY", "")
 
@@ -71,7 +71,6 @@ def fetch_bin_data():
         with urllib.request.urlopen(req) as response:
             res_data = json.loads(response.read().decode())
             record = res_data.get("record", {})
-            # Ensure proper structure
             if "doctors" not in record:
                 record["doctors"] = []
             if "templates" not in record:
@@ -85,9 +84,7 @@ def fetch_bin_data():
 
 def save_bin_data(data):
     url = f"https://api.jsonbin.io/v3/b/{JSON_BIN_ID}"
-    headers = {
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
     if JSON_BIN_MASTER_KEY:
         headers["X-Master-Key"] = JSON_BIN_MASTER_KEY
         
@@ -151,7 +148,7 @@ def render_message(body: str, d: dict) -> str:
 
 def send_email(to_email: str, subject: str, body: str) -> str:
     if not SMTP_USER or not SMTP_PASSWORD:
-        raise ValueError("SMTP credentials not configured in .env")
+        raise ValueError("SMTP credentials not configured in environment")
         
     msg = EmailMessage()
     msg.set_content(body)
@@ -169,8 +166,6 @@ def deliver(d: dict, kind: str, recipient: str, subject: str, body: str, today: 
     data = fetch_bin_data()
     send_logs = data.get("send_log", [])
     
-    # Check if already sent today
-    sent_key = f"{d['id']}_{kind}_{recipient}_{today.isoformat()}"
     already_sent = any(
         l.get("doctor_id") == d["id"] and l.get("kind") == kind and 
         l.get("recipient") == recipient and l.get("sent_on") == today.isoformat() and l.get("status") == "sent"
@@ -312,7 +307,6 @@ def doctors():
         if err:
             flash(err, "err")
         else:
-            # Generate new unique ID
             new_id = max([d.get("id", 0) for d in doctors_list], default=0) + 1
             new_doc["id"] = new_id
             doctors_list.append(new_doc)
@@ -413,9 +407,7 @@ def templates():
         return redirect(url_for("templates"))
         
     t = data.get("templates", DEFAULT_TEMPLATES)
-    # Sort logs descending by timestamp
     logs = sorted(data.get("send_log", []), key=lambda x: x.get("at", ""), reverse=True)[:30]
-    # Map doctor names to logs
     doc_map = {d["id"]: d["name"] for d in data.get("doctors", [])}
     for l in logs:
         l["name"] = doc_map.get(l.get("doctor_id"), "Unknown")
