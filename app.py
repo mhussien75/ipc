@@ -16,6 +16,7 @@ import re
 import secrets
 import smtplib
 import urllib.request
+import urllib.error
 from email.message import EmailMessage
 from datetime import date, datetime
 from functools import wraps
@@ -34,9 +35,9 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 SECRET_KEY = os.getenv("SECRET_KEY", "")
 MANAGER_EMAILS = [p.strip() for p in os.getenv("MANAGER_EMAILS", "").split(",") if p.strip()]
 
-# JSON Bin configuration ( hardcoded your Bin ID and Master Key directly )
+# JSON Bin configuration
 JSON_BIN_ID = os.getenv("JSON_BIN_ID", "6abcf643ac6210605a05327a")
-JSON_BIN_MASTER_KEY = os.getenv("JSON_BIN_MASTER_KEY", "$2a$10$AEh.xH3TcEreYwAoCzjK.ehm62aoYfWf0GbbcIhNtf9vjdUhk95j2")
+JSON_BIN_MASTER_KEY = os.getenv("JSON_BIN_MASTER_KEY", "")
 
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -66,7 +67,9 @@ app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
 # ----------------------------------------------------------- JSON Bin Helpers
 def fetch_bin_data():
     url = f"https://api.jsonbin.io/v3/b/{JSON_BIN_ID}/latest"
-    headers = {"X-Master-Key": JSON_BIN_MASTER_KEY} if JSON_BIN_MASTER_KEY else {}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if JSON_BIN_MASTER_KEY:
+        headers["X-Master-Key"] = JSON_BIN_MASTER_KEY
     try:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req) as response:
@@ -79,13 +82,17 @@ def fetch_bin_data():
             if "send_log" not in record:
                 record["send_log"] = []
             return record
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode()[:300]
+        log.error("JSON Bin fetch HTTP %s: %s", exc.code, err_body)
+        return {"doctors": [], "templates": DEFAULT_TEMPLATES.copy(), "send_log": []}
     except Exception as exc:
         log.error("Failed to fetch data from JSON Bin: %s", exc)
         return {"doctors": [], "templates": DEFAULT_TEMPLATES.copy(), "send_log": []}
 
 def save_bin_data(data):
     url = f"https://api.jsonbin.io/v3/b/{JSON_BIN_ID}"
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
     if JSON_BIN_MASTER_KEY:
         headers["X-Master-Key"] = JSON_BIN_MASTER_KEY
         
@@ -98,6 +105,10 @@ def save_bin_data(data):
         )
         with urllib.request.urlopen(req) as response:
             return True
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode()[:300]
+        log.error("JSON Bin save HTTP %s: %s", exc.code, err_body)
+        return False
     except Exception as exc:
         log.error("Failed to save data to JSON Bin: %s", exc)
         return False
@@ -163,38 +174,6 @@ def send_email(to_email: str, subject: str, body: str) -> str:
         server.send_message(msg)
     return "sent"
 
-def deliver(d: dict, kind: str, recipient: str, subject: str, body: str, today: date):
-    data = fetch_bin_data()
-    send_logs = data.get("send_log", [])
-    
-    already_sent = any(
-        l.get("doctor_id") == d["id"] and l.get("kind") == kind and 
-        l.get("recipient") == recipient and l.get("sent_on") == today.isoformat() and l.get("status") == "sent"
-        for l in send_logs
-    )
-    if already_sent:
-        return
-
-    try:
-        sid = send_email(recipient, subject, body)
-        status, detail = "sent", sid
-    except Exception as exc:  
-        status, detail = "failed", str(exc)[:300]
-        log.error("Send failed (%s -> %s): %s", kind, recipient, exc)
-
-    log_entry = {
-        "doctor_id": d["id"],
-        "kind": kind,
-        "recipient": recipient,
-        "sent_on": today.isoformat(),
-        "status": status,
-        "detail": detail,
-        "at": datetime.utcnow().isoformat()
-    }
-    send_logs.append(log_entry)
-    data["send_log"] = send_logs
-    save_bin_data(data)
-
 def template_body(key: str) -> str:
     data = fetch_bin_data()
     return data.get("templates", {}).get(key, DEFAULT_TEMPLATES.get(key, ""))
@@ -209,8 +188,33 @@ def job_manager_alert():
             continue
         subject = f"Upcoming Birthday Alert: Dr. {d['name']}"
         for m in MANAGER_EMAILS:
-            deliver(d, "manager_alert", m, subject, render_message(body_tpl, d), today)
+            deliver_job_alert(d, m, subject, render_message(body_tpl, d), today)
     log.info("manager_alert job finished")
+
+def deliver_job_alert(d, recipient, subject, body, today):
+    data = fetch_bin_data()
+    send_logs = data.get("send_log", [])
+    already_sent = any(
+        l.get("doctor_id") == d["id"] and l.get("kind") == "manager_alert" and 
+        l.get("recipient") == recipient and l.get("sent_on") == today.isoformat() and l.get("status") == "sent"
+        for l in send_logs
+    )
+    if already_sent:
+        return
+    try:
+        sid = send_email(recipient, subject, body)
+        status, detail = "sent", sid
+    except Exception as exc:  
+        status, detail = "failed", str(exc)[:300]
+        log.error("Send failed: %s", exc)
+
+    send_logs.append({
+        "doctor_id": d["id"], "kind": "manager_alert", "recipient": recipient,
+        "sent_on": today.isoformat(), "status": status, "detail": detail,
+        "at": datetime.utcnow().isoformat()
+    })
+    data["send_log"] = send_logs
+    save_bin_data(data)
 
 def job_birthday_greeting():
     today = local_today()
@@ -221,8 +225,33 @@ def job_birthday_greeting():
         if d["days"] != 0:
             continue
         subject = "Happy Birthday from International Pioneers Co.!"
-        deliver(d, "doctor_greeting", d["email"], subject, render_message(body_tpl, d), today)
+        deliver_job_greeting(d, subject, render_message(body_tpl, d), today)
     log.info("birthday_greeting job finished")
+
+def deliver_job_greeting(d, subject, body, today):
+    data = fetch_bin_data()
+    send_logs = data.get("send_log", [])
+    already_sent = any(
+        l.get("doctor_id") == d["id"] and l.get("kind") == "doctor_greeting" and 
+        l.get("recipient") == d["email"] and l.get("sent_on") == today.isoformat() and l.get("status") == "sent"
+        for l in send_logs
+    )
+    if already_sent:
+        return
+    try:
+        sid = send_email(d["email"], subject, body)
+        status, detail = "sent", sid
+    except Exception as exc:  
+        status, detail = "failed", str(exc)[:300]
+        log.error("Send failed: %s", exc)
+
+    send_logs.append({
+        "doctor_id": d["id"], "kind": "doctor_greeting", "recipient": d["email"],
+        "sent_on": today.isoformat(), "status": status, "detail": detail,
+        "at": datetime.utcnow().isoformat()
+    })
+    data["send_log"] = send_logs
+    save_bin_data(data)
 
 def start_scheduler():
     if os.getenv("RUN_SCHEDULER", "1") != "1":
@@ -315,7 +344,7 @@ def doctors():
             if save_bin_data(data):
                 flash("Doctor added successfully", "ok")
             else:
-                flash("Failed to save to JSON Bin", "err")
+                flash("Failed to save to JSON Bin (Check Render logs for details)", "err")
         return redirect(url_for("doctors"))
         
     q = request.args.get("q", "").strip().lower()
@@ -431,23 +460,16 @@ def templates():
                         sid = send_email(rec, subject, body)
                         success_count += 1
                         send_logs.append({
-                            "doctor_id": d["id"],
-                            "kind": template_key,
-                            "recipient": rec,
-                            "sent_on": today.isoformat(),
-                            "status": "sent",
-                            "detail": f"Manual trigger ({sid})",
-                            "at": datetime.utcnow().isoformat()
+                            "doctor_id": d["id"], "kind": template_key, "recipient": rec,
+                            "sent_on": today.isoformat(), "status": "sent",
+                            "detail": f"Manual trigger ({sid})", "at": datetime.utcnow().isoformat()
                         })
                     except Exception as exc:
                         errors.append(str(exc)[:100])
                         log.error("Manual send error (%s): %s", rec, exc)
                         send_logs.append({
-                            "doctor_id": d["id"],
-                            "kind": template_key,
-                            "recipient": rec,
-                            "sent_on": today.isoformat(),
-                            "status": "failed",
+                            "doctor_id": d["id"], "kind": template_key, "recipient": rec,
+                            "sent_on": today.isoformat(), "status": "failed",
                             "detail": f"Manual trigger failed: {str(exc)[:150]}",
                             "at": datetime.utcnow().isoformat()
                         })
