@@ -1,4 +1,4 @@
-"""Doctor Birthday Automation: Flask + JSON Bin + APScheduler + Email SMTP.
+"""Doctor Birthday Automation: Flask + JSON Bin + Brevo API + APScheduler.
 
 Run locally:  python app.py
 Production:   gunicorn app:app --workers 1 --threads 4 --bind 0.0.0.0:$PORT
@@ -14,10 +14,8 @@ import logging
 import os
 import re
 import secrets
-import smtplib
 import urllib.request
 import urllib.error
-from email.message import EmailMessage
 from datetime import date, datetime
 from functools import wraps
 from zoneinfo import ZoneInfo
@@ -39,11 +37,9 @@ MANAGER_EMAILS = [p.strip() for p in os.getenv("MANAGER_EMAILS", "").split(",") 
 JSON_BIN_ID = os.getenv("JSON_BIN_ID", "6abcf643ac6210605a05327a")
 JSON_BIN_MASTER_KEY = os.getenv("JSON_BIN_MASTER_KEY", "")
 
-SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-SENDER_EMAIL = os.getenv("SENDER_EMAIL", SMTP_USER)
+# Brevo API configuration
+BREVO_API_KEY = os.getenv("BREVO_API_KEY", "")
+SENDER_EMAIL = os.getenv("SENDER_EMAIL", "hussienbloom@gmail.com")
 
 if not (ADMIN_PASSWORD and SECRET_KEY):
     raise SystemExit("Set ADMIN_PASSWORD and SECRET_KEY environment variables.")
@@ -159,20 +155,30 @@ def render_message(body: str, d: dict) -> str:
     return body.format_map(ctx)
 
 def send_email(to_email: str, subject: str, body: str) -> str:
-    if not SMTP_USER or not SMTP_PASSWORD:
-        raise ValueError("SMTP credentials not configured in environment")
-        
-    msg = EmailMessage()
-    msg.set_content(body)
-    msg["Subject"] = subject
-    msg["From"] = SENDER_EMAIL
-    msg["To"] = to_email
-
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg)
-    return "sent"
+    if not BREVO_API_KEY:
+        raise ValueError("BREVO_API_KEY is not set in the environment")
+    payload = {
+        "sender": {"name": "International Pioneers Co.", "email": SENDER_EMAIL},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "textContent": body,
+    }
+    req = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "api-key": BREVO_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20):
+            return "sent"
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Brevo HTTP {exc.code}: {exc.read().decode()[:200]}")
 
 def template_body(key: str) -> str:
     data = fetch_bin_data()
@@ -481,7 +487,7 @@ def templates():
                 if success_count > 0:
                     flash(f"Template sent successfully to {success_count} recipient(s)!", "ok")
                 else:
-                    flash(f"Failed to connect or send email. Check SMTP settings. Error: {', '.join(errors)}", "err")
+                    flash(f"Failed to send email via Brevo API. Error: {', '.join(errors)}", "err")
             return redirect(url_for("templates"))
 
         t_dict = data.get("templates", {})
