@@ -34,9 +34,9 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 SECRET_KEY = os.getenv("SECRET_KEY", "")
 MANAGER_EMAILS = [p.strip() for p in os.getenv("MANAGER_EMAILS", "").split(",") if p.strip()]
 
-# JSON Bin configuration
+# JSON Bin configuration ( hardcoded your Bin ID and Master Key directly )
 JSON_BIN_ID = os.getenv("JSON_BIN_ID", "6abcf643ac6210605a05327a")
-JSON_BIN_MASTER_KEY = os.getenv("JSON_BIN_MASTER_KEY", "")
+JSON_BIN_MASTER_KEY = os.getenv("JSON_BIN_MASTER_KEY", "$2a$10$AEh.xH3TcEreYwAoCzjK.ehm62aoYfWf0GbbcIhNtf9vjdUhk95j2")
 
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -399,7 +399,6 @@ def templates():
     if request.method == "POST":
         action = request.form.get("action")
         
-        # Handle manual instant template dispatch
         if action == "send_now":
             doctor_id = int(request.form.get("doctor_id", 0))
             template_key = request.form.get("template_key", "")
@@ -462,7 +461,6 @@ def templates():
                     flash(f"Failed to send: {', '.join(errors)}", "err")
             return redirect(url_for("templates"))
 
-        # Handle updating template texts
         t_dict = data.get("templates", {})
         for key in DEFAULT_TEMPLATES:
             body = request.form.get(key, "").strip()
