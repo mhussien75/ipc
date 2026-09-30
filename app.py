@@ -344,7 +344,7 @@ def doctors():
             if save_bin_data(data):
                 flash("Doctor added successfully", "ok")
             else:
-                flash("Failed to save to JSON Bin (Check Render logs for details)", "err")
+                flash("Failed to save to JSON Bin", "err")
         return redirect(url_for("doctors"))
         
     q = request.args.get("q", "").strip().lower()
@@ -465,12 +465,13 @@ def templates():
                             "detail": f"Manual trigger ({sid})", "at": datetime.utcnow().isoformat()
                         })
                     except Exception as exc:
-                        errors.append(str(exc)[:100])
+                        err_msg = str(exc)
+                        errors.append(err_msg[:100])
                         log.error("Manual send error (%s): %s", rec, exc)
                         send_logs.append({
                             "doctor_id": d["id"], "kind": template_key, "recipient": rec,
                             "sent_on": today.isoformat(), "status": "failed",
-                            "detail": f"Manual trigger failed: {str(exc)[:150]}",
+                            "detail": f"Manual trigger failed: {err_msg[:150]}",
                             "at": datetime.utcnow().isoformat()
                         })
                         
@@ -480,7 +481,7 @@ def templates():
                 if success_count > 0:
                     flash(f"Template sent successfully to {success_count} recipient(s)!", "ok")
                 else:
-                    flash(f"Failed to send: {', '.join(errors)}", "err")
+                    flash(f"Failed to connect or send email. Check SMTP settings. Error: {', '.join(errors)}", "err")
             return redirect(url_for("templates"))
 
         t_dict = data.get("templates", {})
