@@ -1,4 +1,4 @@
-"""Doctor Birthday Automation: Flask + SQLite + APScheduler + Email SMTP.
+"""Doctor Birthday Automation: Flask + JSON Bin + APScheduler + Email SMTP.
 
 Run locally:  python app.py
 Production:   gunicorn app:app --workers 1 --threads 4 --bind 0.0.0.0:$PORT
@@ -7,14 +7,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import csv
-import hmac
 import io
+import json
 import logging
 import os
 import re
 import secrets
-import sqlite3
 import smtplib
+import urllib.request
 from email.message import EmailMessage
 from datetime import date, datetime
 from functools import wraps
@@ -27,12 +27,15 @@ from flask import (Flask, abort, flash, g, redirect, render_template_string,
 from jinja2 import DictLoader
 
 # ----------------------------------------------------------------- config
-DB_PATH = os.getenv("DB_PATH", "birthdays.db")
 TZ = os.getenv("APP_TIMEZONE", "UTC") 
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 SECRET_KEY = os.getenv("SECRET_KEY", "")
 MANAGER_EMAILS = [p.strip() for p in os.getenv("MANAGER_EMAILS", "").split(",") if p.strip()]
+
+# JSON Bin configuration
+JSON_BIN_ID = os.getenv("JSON_BIN_ID", "6abcf643ac6210605a05327a")
+JSON_BIN_MASTER_KEY = os.getenv("JSON_BIN_MASTER_KEY", "")
 
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -48,7 +51,7 @@ log = logging.getLogger("birthdays")
 
 DEFAULT_TEMPLATES = {
     "manager_alert": ("Reminder: Dr. {name}'s birthday is in {days_left} days "
-                      "({birthday}). Turning {age}. Email: {email}."),
+                      "({birthday}). Turning {age}. Email: {email} | Phone: {phone}."),
     "doctor_greeting": ("Dear Dr. {name},\n\nWishing you a very happy birthday and a "
                         "wonderful year ahead!\n\nWarm regards,\nInternational Pioneers Co."),
 }
@@ -59,37 +62,62 @@ app.secret_key = SECRET_KEY
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
                   SESSION_COOKIE_SECURE=os.getenv("INSECURE_COOKIES") != "1")
 
-# --------------------------------------------------------------------- db
-def connect():
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ----------------------------------------------------------- JSON Bin Helpers
+def fetch_bin_data():
+    url = f"https://api.jsonbin.io/v3/b/{JSON_BIN_ID}/latest"
+    headers = {"X-Master-Key": JSON_BIN_MASTER_KEY} if JSON_BIN_MASTER_KEY else {}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req) as response:
+            res_data = json.loads(response.read().decode())
+            record = res_data.get("record", {})
+            # Ensure proper structure
+            if "doctors" not in record:
+                record["doctors"] = []
+            if "templates" not in record:
+                record["templates"] = DEFAULT_TEMPLATES
+            if "send_log" not in record:
+                record["send_log"] = []
+            return record
+    except Exception as exc:
+        log.error("Failed to fetch data from JSON Bin: %s", exc)
+        return {"doctors": [], "templates": DEFAULT_TEMPLATES.copy(), "send_log": []}
 
-def init_db():
-    with connect() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS doctors(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL, email TEXT NOT NULL, dob TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS templates(key TEXT PRIMARY KEY, body TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS send_log(
-            doctor_id INTEGER, kind TEXT, recipient TEXT, sent_on TEXT,
-            status TEXT, detail TEXT, at TEXT,
-            PRIMARY KEY(doctor_id, kind, recipient, sent_on));
-        """)
-        for k, v in DEFAULT_TEMPLATES.items():
-            c.execute("INSERT OR IGNORE INTO templates(key, body) VALUES(?,?)", (k, v))
+def save_bin_data(data):
+    url = f"https://api.jsonbin.io/v3/b/{JSON_BIN_ID}"
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if JSON_BIN_MASTER_KEY:
+        headers["X-Master-Key"] = JSON_BIN_MASTER_KEY
+        
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data).encode("utf-8"),
+            headers=headers,
+            method="PUT"
+        )
+        with urllib.request.urlopen(req) as response:
+            return True
+    except Exception as exc:
+        log.error("Failed to save data to JSON Bin: %s", exc)
+        return False
 
-def get_db():
-    if "db" not in g:
-        g.db = connect()
-    return g.db
-
-@app.teardown_appcontext
-def close_db(_):
-    db = g.pop("db", None)
-    if db:
-        db.close()
+def init_json_bin():
+    data = fetch_bin_data()
+    updated = False
+    if "templates" not in data or not data["templates"]:
+        data["templates"] = DEFAULT_TEMPLATES.copy()
+        updated = True
+    if "doctors" not in data:
+        data["doctors"] = []
+        updated = True
+    if "send_log" not in data:
+        data["send_log"] = []
+        updated = True
+    if updated:
+        save_bin_data(data)
 
 # ------------------------------------------------------------ date logic
 def local_today() -> date:
@@ -108,7 +136,7 @@ def next_birthday(dob: date, today: date) -> date:
 def enrich(row, today):
     dob = date.fromisoformat(row["dob"])
     nb = next_birthday(dob, today)
-    return {"id": row["id"], "name": row["name"], "email": row["email"], "dob": dob,
+    return {"id": row["id"], "name": row["name"], "email": row["email"], "phone": row.get("phone", ""), "dob": dob,
             "next": nb, "days": (nb - today).days, "turning": nb.year - dob.year}
 
 # -------------------------------------------------------------- messaging
@@ -117,7 +145,7 @@ class SafeDict(dict):
         return "{" + key + "}"
 
 def render_message(body: str, d: dict) -> str:
-    ctx = SafeDict(name=d["name"], email=d["email"], dob=d["dob"].isoformat(),
+    ctx = SafeDict(name=d["name"], email=d["email"], phone=d["phone"], dob=d["dob"].isoformat(),
                    birthday=d["next"].strftime("%d %B"), days_left=d["days"], age=d["turning"])
     return body.format_map(ctx)
 
@@ -138,31 +166,48 @@ def send_email(to_email: str, subject: str, body: str) -> str:
     return "sent"
 
 def deliver(d: dict, kind: str, recipient: str, subject: str, body: str, today: date):
-    key = (d["id"], kind, recipient, today.isoformat())
-    with connect() as c:
-        if c.execute("SELECT 1 FROM send_log WHERE doctor_id=? AND kind=? AND recipient=? "
-                     "AND sent_on=? AND status='sent'", key).fetchone():
-            return
+    data = fetch_bin_data()
+    send_logs = data.get("send_log", [])
+    
+    # Check if already sent today
+    sent_key = f"{d['id']}_{kind}_{recipient}_{today.isoformat()}"
+    already_sent = any(
+        l.get("doctor_id") == d["id"] and l.get("kind") == kind and 
+        l.get("recipient") == recipient and l.get("sent_on") == today.isoformat() and l.get("status") == "sent"
+        for l in send_logs
+    )
+    if already_sent:
+        return
+
     try:
         sid = send_email(recipient, subject, body)
         status, detail = "sent", sid
     except Exception as exc:  
         status, detail = "failed", str(exc)[:300]
         log.error("Send failed (%s -> %s): %s", kind, recipient, exc)
-    with connect() as c:
-        c.execute("INSERT OR REPLACE INTO send_log VALUES(?,?,?,?,?,?,?)",
-                  (*key, status, detail, datetime.utcnow().isoformat()))
+
+    log_entry = {
+        "doctor_id": d["id"],
+        "kind": kind,
+        "recipient": recipient,
+        "sent_on": today.isoformat(),
+        "status": status,
+        "detail": detail,
+        "at": datetime.utcnow().isoformat()
+    }
+    send_logs.append(log_entry)
+    data["send_log"] = send_logs
+    save_bin_data(data)
 
 def template_body(key: str) -> str:
-    with connect() as c:
-        return c.execute("SELECT body FROM templates WHERE key=?", (key,)).fetchone()["body"]
+    data = fetch_bin_data()
+    return data.get("templates", {}).get(key, DEFAULT_TEMPLATES.get(key, ""))
 
 def job_manager_alert():
     today = local_today()
     body_tpl = template_body("manager_alert")
-    with connect() as c:
-        rows = c.execute("SELECT * FROM doctors").fetchall()
-    for row in rows:
+    data = fetch_bin_data()
+    for row in data.get("doctors", []):
         d = enrich(row, today)
         if d["days"] != 5:
             continue
@@ -174,9 +219,8 @@ def job_manager_alert():
 def job_birthday_greeting():
     today = local_today()
     body_tpl = template_body("doctor_greeting")
-    with connect() as c:
-        rows = c.execute("SELECT * FROM doctors").fetchall()
-    for row in rows:
+    data = fetch_bin_data()
+    for row in data.get("doctors", []):
         d = enrich(row, today)
         if d["days"] != 0:
             continue
@@ -237,13 +281,15 @@ def logout():
 @login_required
 def dashboard():
     today = local_today()
-    rows = [enrich(r, today) for r in get_db().execute("SELECT * FROM doctors")]
+    data = fetch_bin_data()
+    rows = [enrich(r, today) for r in data.get("doctors", [])]
     upcoming = sorted((d for d in rows if d["days"] <= 7), key=lambda d: (d["days"], d["name"]))
     return render_template_string(DASH, upcoming=upcoming, total=len(rows), today=today)
 
 def validate(form):
     name = form.get("name", "").strip()
     email = form.get("email", "").strip()
+    phone = form.get("phone", "").strip()
     dob = form.get("dob", "").strip()
     try:
         date.fromisoformat(dob)
@@ -253,49 +299,73 @@ def validate(form):
         return None, "Name is required"
     if not EMAIL_RE.fullmatch(email):
         return None, "Valid email address is required"
-    return (name, email, dob), None
+    return {"name": name, "email": email, "phone": phone, "dob": dob}, None
 
 @app.route("/doctors", methods=["GET", "POST"])
 @login_required
 def doctors():
-    db = get_db()
+    data = fetch_bin_data()
+    doctors_list = data.get("doctors", [])
+    
     if request.method == "POST":
-        data, err = validate(request.form)
+        new_doc, err = validate(request.form)
         if err:
             flash(err, "err")
         else:
-            db.execute("INSERT INTO doctors(name, email, dob) VALUES(?,?,?)", data)
-            db.commit()
-            flash("Doctor added", "ok")
+            # Generate new unique ID
+            new_id = max([d.get("id", 0) for d in doctors_list], default=0) + 1
+            new_doc["id"] = new_id
+            doctors_list.append(new_doc)
+            data["doctors"] = doctors_list
+            if save_bin_data(data):
+                flash("Doctor added successfully", "ok")
+            else:
+                flash("Failed to save to JSON Bin", "err")
         return redirect(url_for("doctors"))
-    q = request.args.get("q", "").strip()
-    rows = db.execute("SELECT * FROM doctors WHERE name LIKE ? OR email LIKE ? ORDER BY name",
-                      (f"%{q}%", f"%{q}%")).fetchall()
+        
+    q = request.args.get("q", "").strip().lower()
+    if q:
+        rows = [d for d in doctors_list if q in d["name"].lower() or q in d["email"].lower() or q in d.get("phone", "").lower()]
+    else:
+        rows = sorted(doctors_list, key=lambda x: x["name"])
     return render_template_string(DOCTORS, rows=rows, q=q)
 
 @app.route("/doctors/<int:did>/edit", methods=["GET", "POST"])
 @login_required
 def edit_doctor(did):
-    db = get_db()
-    row = db.execute("SELECT * FROM doctors WHERE id=?", (did,)).fetchone() or abort(404)
+    data = fetch_bin_data()
+    doctors_list = data.get("doctors", [])
+    doc = next((d for d in doctors_list if d["id"] == did), None)
+    if not doc:
+        abort(404)
+        
     if request.method == "POST":
-        data, err = validate(request.form)
+        updated_data, err = validate(request.form)
         if err:
             flash(err, "err")
         else:
-            db.execute("UPDATE doctors SET name=?, email=?, dob=? WHERE id=?", (*data, did))
-            db.commit()
-            flash("Saved", "ok")
+            doc["name"] = updated_data["name"]
+            doc["email"] = updated_data["email"]
+            doc["phone"] = updated_data["phone"]
+            doc["dob"] = updated_data["dob"]
+            data["doctors"] = doctors_list
+            if save_bin_data(data):
+                flash("Saved", "ok")
+            else:
+                flash("Failed to save update", "err")
             return redirect(url_for("doctors"))
-    return render_template_string(EDIT, d=row)
+    return render_template_string(EDIT, d=doc)
 
 @app.post("/doctors/<int:did>/delete")
 @login_required
 def delete_doctor(did):
-    db = get_db()
-    db.execute("DELETE FROM doctors WHERE id=?", (did,))
-    db.commit()
-    flash("Doctor deleted", "ok")
+    data = fetch_bin_data()
+    doctors_list = data.get("doctors", [])
+    data["doctors"] = [d for d in doctors_list if d["id"] != did]
+    if save_bin_data(data):
+        flash("Doctor deleted", "ok")
+    else:
+        flash("Failed to delete", "err")
     return redirect(url_for("doctors"))
 
 @app.post("/doctors/import")
@@ -306,34 +376,50 @@ def import_doctors():
         flash("Choose a CSV file", "err")
         return redirect(url_for("doctors"))
     reader = csv.DictReader(io.StringIO(f.read().decode("utf-8-sig")))
-    good, bad = [], 0
+    data = fetch_bin_data()
+    doctors_list = data.get("doctors", [])
+    next_id = max([d.get("id", 0) for d in doctors_list], default=0) + 1
+    
+    good, bad = 0, 0
     for row in reader:
-        data, err = validate({k.strip().lower(): (v or "") for k, v in row.items() if k})
+        cleaned_row = {k.strip().lower(): (v or "") for k, v in row.items() if k}
+        new_doc, err = validate(cleaned_row)
         if not err:
-            good.append(data)
+            new_doc["id"] = next_id
+            doctors_list.append(new_doc)
+            next_id += 1
+            good += 1
         else:
             bad += 1
-    db = get_db()
-    db.executemany("INSERT INTO doctors(name, email, dob) VALUES(?,?,?)", good)
-    db.commit()
-    flash(f"Imported {len(good)} rows, skipped {bad} invalid", "ok" if good else "err")
+            
+    data["doctors"] = doctors_list
+    save_bin_data(data)
+    flash(f"Imported {good} rows, skipped {bad} invalid", "ok" if good else "err")
     return redirect(url_for("doctors"))
 
 @app.route("/templates", methods=["GET", "POST"])
 @login_required
 def templates():
-    db = get_db()
+    data = fetch_bin_data()
     if request.method == "POST":
+        t_dict = data.get("templates", {})
         for key in DEFAULT_TEMPLATES:
             body = request.form.get(key, "").strip()
             if body:
-                db.execute("UPDATE templates SET body=? WHERE key=?", (body, key))
-        db.commit()
+                t_dict[key] = body
+        data["templates"] = t_dict
+        save_bin_data(data)
         flash("Templates saved", "ok")
         return redirect(url_for("templates"))
-    t = {r["key"]: r["body"] for r in db.execute("SELECT * FROM templates")}
-    logs = db.execute("SELECT l.*, d.name FROM send_log l LEFT JOIN doctors d ON d.id=l.doctor_id "
-                      "ORDER BY at DESC LIMIT 30").fetchall()
+        
+    t = data.get("templates", DEFAULT_TEMPLATES)
+    # Sort logs descending by timestamp
+    logs = sorted(data.get("send_log", []), key=lambda x: x.get("at", ""), reverse=True)[:30]
+    # Map doctor names to logs
+    doc_map = {d["id"]: d["name"] for d in data.get("doctors", [])}
+    for l in logs:
+        l["name"] = doc_map.get(l.get("doctor_id"), "Unknown")
+        
     return render_template_string(TEMPLATES, t=t, logs=logs, managers=MANAGER_EMAILS)
 
 # -------------------------------------------------------------- html/css
@@ -369,8 +455,8 @@ LOGIN = """{% extends 'base' %}{% block body %}<div class="card" style="max-widt
 
 DASH = """{% extends 'base' %}{% block body %}<div class="card"><h2>Upcoming birthdays (next 7 days)</h2>
 <small>{{ total }} doctors in database. Today: {{ today }}</small>
-{% if upcoming %}<table><tr><th>Doctor</th><th>Email</th><th>Birthday</th><th>In</th><th>Turning</th></tr>
-{% for d in upcoming %}<tr><td>{{ d.name }}</td><td>{{ d.email }}</td><td>{{ d.next.strftime('%a %d %b') }}</td>
+{% if upcoming %}<table><tr><th>Doctor</th><th>Email</th><th>Phone</th><th>Birthday</th><th>In</th><th>Turning</th></tr>
+{% for d in upcoming %}<tr><td>{{ d.name }}</td><td>{{ d.email }}</td><td>{{ d.phone }}</td><td>{{ d.next.strftime('%a %d %b') }}</td>
 <td>{% if d.days == 0 %}<span class="tag">Today</span>{% else %}{{ d.days }} day(s){% endif %}</td>
 <td>{{ d.turning }}</td></tr>{% endfor %}</table>
 {% else %}<p>No birthdays in the next 7 days.</p>{% endif %}</div>{% endblock %}"""
@@ -378,16 +464,17 @@ DASH = """{% extends 'base' %}{% block body %}<div class="card"><h2>Upcoming bir
 DOCTORS = """{% extends 'base' %}{% block body %}
 <div class="card"><h3>Add doctor</h3><form method="post"><input type="hidden" name="csrf" value="{{ csrf }}">
 <div class="row"><input name="name" placeholder="Full name" required>
-<input name="email" type="email" placeholder="doctor@example.com" required><input name="dob" type="date" required>
+<input name="email" type="email" placeholder="doctor@example.com" required>
+<input name="phone" placeholder="Phone number" required><input name="dob" type="date" required>
 <button class="p" style="flex:0">Add</button></div></form>
 <form method="post" action="{{ url_for('import_doctors') }}" enctype="multipart/form-data" style="margin-top:14px">
 <input type="hidden" name="csrf" value="{{ csrf }}"><div class="row">
 <input type="file" name="file" accept=".csv"><button class="p" style="flex:0">Import CSV</button></div>
-<small>CSV columns: name, email, dob (YYYY-MM-DD)</small></form></div>
-<div class="card"><form method="get" class="row"><input name="q" value="{{ q }}" placeholder="Search name/email">
+<small>CSV columns: name, email, phone, dob (YYYY-MM-DD)</small></form></div>
+<div class="card"><form method="get" class="row"><input name="q" value="{{ q }}" placeholder="Search name/email/phone">
 <button class="p" style="flex:0">Search</button></form>
-<table><tr><th>Name</th><th>Email</th><th>DOB</th><th></th></tr>
-{% for r in rows %}<tr><td>{{ r.name }}</td><td>{{ r.email }}</td><td>{{ r.dob }}</td>
+<table><tr><th>Name</th><th>Email</th><th>Phone</th><th>DOB</th><th></th></tr>
+{% for r in rows %}<tr><td>{{ r.name }}</td><td>{{ r.email }}</td><td>{{ r.phone }}</td><td>{{ r.dob }}</td>
 <td style="white-space:nowrap"><a class="btn" href="{{ url_for('edit_doctor', did=r.id) }}">Edit</a>
 <form method="post" action="{{ url_for('delete_doctor', did=r.id) }}" style="display:inline"
 onsubmit="return confirm('Delete {{ r.name|e }}?')"><input type="hidden" name="csrf" value="{{ csrf }}">
@@ -397,11 +484,12 @@ onsubmit="return confirm('Delete {{ r.name|e }}?')"><input type="hidden" name="c
 EDIT = """{% extends 'base' %}{% block body %}<div class="card"><h3>Edit doctor</h3>
 <form method="post"><input type="hidden" name="csrf" value="{{ csrf }}">
 <p><input name="name" value="{{ d.name }}" required></p><p><input name="email" type="email" value="{{ d.email }}" required></p>
+<p><input name="phone" value="{{ d.phone }}" required></p>
 <p><input name="dob" type="date" value="{{ d.dob }}" required></p>
 <button class="p">Save</button> <a href="{{ url_for('doctors') }}">Cancel</a></form></div>{% endblock %}"""
 
 TEMPLATES = """{% extends 'base' %}{% block body %}<div class="card"><h3>Message templates</h3>
-<small>Placeholders: {name} {email} {dob} {birthday} {days_left} {age}</small>
+<small>Placeholders: {name} {email} {phone} {dob} {birthday} {days_left} {age}</small>
 <form method="post"><input type="hidden" name="csrf" value="{{ csrf }}">
 <p><b>Manager Alert</b> (8:00, 5 days before) to: {{ managers|join(', ') or 'no managers configured' }}</p>
 <textarea name="manager_alert" rows="4">{{ t.manager_alert }}</textarea>
@@ -415,7 +503,7 @@ TEMPLATES = """{% extends 'base' %}{% block body %}<div class="card"><h3>Message
 app.jinja_loader = DictLoader({"base": BASE})
 
 # ---------------------------------------------------------------- startup
-init_db()
+init_json_bin()
 start_scheduler()
 
 if __name__ == "__main__":
