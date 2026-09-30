@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import csv
+import hmac
 import io
 import json
 import logging
@@ -15,7 +16,6 @@ import re
 import secrets
 import smtplib
 import urllib.request
-import hmac
 from email.message import EmailMessage
 from datetime import date, datetime
 from functools import wraps
@@ -34,7 +34,7 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 SECRET_KEY = os.getenv("SECRET_KEY", "")
 MANAGER_EMAILS = [p.strip() for p in os.getenv("MANAGER_EMAILS", "").split(",") if p.strip()]
 
-# JSON Bin configuration ( hardcoded your Bin ID directly )
+# JSON Bin configuration
 JSON_BIN_ID = os.getenv("JSON_BIN_ID", "6abcf643ac6210605a05327a")
 JSON_BIN_MASTER_KEY = os.getenv("JSON_BIN_MASTER_KEY", "")
 
@@ -397,6 +397,72 @@ def import_doctors():
 def templates():
     data = fetch_bin_data()
     if request.method == "POST":
+        action = request.form.get("action")
+        
+        # Handle manual instant template dispatch
+        if action == "send_now":
+            doctor_id = int(request.form.get("doctor_id", 0))
+            template_key = request.form.get("template_key", "")
+            
+            doctors_list = data.get("doctors", [])
+            doc_row = next((d for d in doctors_list if d["id"] == doctor_id), None)
+            
+            if not doc_row:
+                flash("Selected doctor not found", "err")
+            elif template_key not in DEFAULT_TEMPLATES:
+                flash("Invalid template selected", "err")
+            else:
+                today = local_today()
+                d = enrich(doc_row, today)
+                body_tpl = data.get("templates", DEFAULT_TEMPLATES).get(template_key, DEFAULT_TEMPLATES[template_key])
+                recipients_list = MANAGER_EMAILS if template_key == "manager_alert" else [d["email"]]
+                
+                if template_key == "manager_alert" and not recipients_list:
+                    flash("No manager emails configured in environment", "err")
+                    return redirect(url_for("templates"))
+                
+                success_count = 0
+                errors = []
+                subject = f"Upcoming Birthday Alert: Dr. {d['name']}" if template_key == "manager_alert" else "Happy Birthday from International Pioneers Co.!"
+                body = render_message(body_tpl, d)
+                send_logs = data.get("send_log", [])
+                
+                for rec in recipients_list:
+                    try:
+                        sid = send_email(rec, subject, body)
+                        success_count += 1
+                        send_logs.append({
+                            "doctor_id": d["id"],
+                            "kind": template_key,
+                            "recipient": rec,
+                            "sent_on": today.isoformat(),
+                            "status": "sent",
+                            "detail": f"Manual trigger ({sid})",
+                            "at": datetime.utcnow().isoformat()
+                        })
+                    except Exception as exc:
+                        errors.append(str(exc)[:100])
+                        log.error("Manual send error (%s): %s", rec, exc)
+                        send_logs.append({
+                            "doctor_id": d["id"],
+                            "kind": template_key,
+                            "recipient": rec,
+                            "sent_on": today.isoformat(),
+                            "status": "failed",
+                            "detail": f"Manual trigger failed: {str(exc)[:150]}",
+                            "at": datetime.utcnow().isoformat()
+                        })
+                        
+                data["send_log"] = send_logs
+                save_bin_data(data)
+                
+                if success_count > 0:
+                    flash(f"Template sent successfully to {success_count} recipient(s)!", "ok")
+                else:
+                    flash(f"Failed to send: {', '.join(errors)}", "err")
+            return redirect(url_for("templates"))
+
+        # Handle updating template texts
         t_dict = data.get("templates", {})
         for key in DEFAULT_TEMPLATES:
             body = request.form.get(key, "").strip()
@@ -408,12 +474,13 @@ def templates():
         return redirect(url_for("templates"))
         
     t = data.get("templates", DEFAULT_TEMPLATES)
+    doctors = sorted(data.get("doctors", []), key=lambda x: x.get("name", ""))
     logs = sorted(data.get("send_log", []), key=lambda x: x.get("at", ""), reverse=True)[:30]
     doc_map = {d["id"]: d["name"] for d in data.get("doctors", [])}
     for l in logs:
         l["name"] = doc_map.get(l.get("doctor_id"), "Unknown")
         
-    return render_template_string(TEMPLATES, t=t, logs=logs, managers=MANAGER_EMAILS)
+    return render_template_string(TEMPLATES, t=t, logs=logs, managers=MANAGER_EMAILS, doctors=doctors)
 
 # -------------------------------------------------------------- html/css
 BASE = """<!doctype html><html><head><meta charset="utf-8">
@@ -425,7 +492,7 @@ nav a,nav button{color:#fff;text-decoration:none;background:none;border:0;font:i
 nav form{margin-left:auto}main{max-width:960px;margin:24px auto;padding:0 16px}
 .card{background:#fff;border-radius:8px;padding:20px;margin-bottom:20px;box-shadow:0 1px 3px #0001}
 table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px;border-bottom:1px solid #eee}
-input,textarea{padding:8px;border:1px solid #ccd;border-radius:4px;font:inherit;width:100%;box-sizing:border-box}
+input,textarea,select{padding:8px;border:1px solid #ccd;border-radius:4px;font:inherit;width:100%;box-sizing:border-box}
 .row{display:flex;gap:10px;flex-wrap:wrap}.row>*{flex:1;min-width:160px}
 button.p,a.btn{background:#2a6df4;color:#fff;border:0;padding:8px 14px;border-radius:4px;cursor:pointer;text-decoration:none}
 button.d{background:#d33;color:#fff;border:0;padding:6px 10px;border-radius:4px;cursor:pointer}
@@ -481,7 +548,26 @@ EDIT = """{% extends 'base' %}{% block body %}<div class="card"><h3>Edit doctor<
 <p><input name="dob" type="date" value="{{ d.dob }}" required></p>
 <button class="p">Save</button> <a href="{{ url_for('doctors') }}">Cancel</a></form></div>{% endblock %}"""
 
-TEMPLATES = """{% extends 'base' %}{% block body %}<div class="card"><h3>Message templates</h3>
+TEMPLATES = """{% extends 'base' %}{% block body %}
+<div class="card"><h3>Send Template Now</h3>
+<small>Choose a doctor and template to dispatch immediately.</small>
+<form method="post" style="margin-top:12px">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="action" value="send_now">
+<div class="row">
+<select name="doctor_id" required>
+<option value="" disabled selected>-- Select Doctor --</option>
+{% for doc in doctors %}<option value="{{ doc.id }}">{{ doc.name }} ({{ doc.email }})</option>{% endfor %}
+</select>
+<select name="template_key" required>
+<option value="" disabled selected>-- Select Template --</option>
+<option value="manager_alert">Manager Alert</option>
+<option value="doctor_greeting">Doctor Greeting</option>
+</select>
+<button class="p" style="flex:0">Send Now</button>
+</div></form></div>
+
+<div class="card"><h3>Message templates</h3>
 <small>Placeholders: {name} {email} {phone} {dob} {birthday} {days_left} {age}</small>
 <form method="post"><input type="hidden" name="csrf" value="{{ csrf }}">
 <p><b>Manager Alert</b> (8:00, 5 days before) to: {{ managers|join(', ') or 'no managers configured' }}</p>
@@ -489,6 +575,7 @@ TEMPLATES = """{% extends 'base' %}{% block body %}<div class="card"><h3>Message
 <p><b>Doctor Greeting</b> (10:00, on the birthday)</p>
 <textarea name="doctor_greeting" rows="4">{{ t.doctor_greeting }}</textarea>
 <p><button class="p">Save templates</button></p></form></div>
+
 <div class="card"><h3>Recent sends</h3><table><tr><th>When (UTC)</th><th>Type</th><th>Doctor</th><th>To</th><th>Status</th></tr>
 {% for l in logs %}<tr><td>{{ l.at[:16] }}</td><td>{{ l.kind }}</td><td>{{ l.name }}</td><td>{{ l.recipient }}</td>
 <td title="{{ l.detail }}">{{ l.status }}</td></tr>{% endfor %}</table></div>{% endblock %}"""
